@@ -1,6 +1,8 @@
 require("dotenv").config();
 const express = require("express");
 const cron = require("node-cron");
+const axios = require("axios");
+const fetch = require("node-fetch");
 
 const pingHost = require("./pingCheck");
 const httpCheck = require("./httpCheck");
@@ -9,19 +11,11 @@ const tcpCheck = require("./tcpCheck");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-
-const TARGET = process.env.TARGET;
-const HTTP_TARGET = process.env.HTTP_TARGET;
 const INTERVAL = process.env.CHECK_INTERVAL || 30;
 
-const regions = [
-    "india",
-    "america",
-    "australia",
-    "russia",
-    "china",
-    "japan"
-];
+// Backend config
+const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:5000";
+const AGENT_TOKEN = process.env.AGENT_TOKEN || "";
 
 // Alert thresholds
 const thresholds = {
@@ -30,6 +24,13 @@ const thresholds = {
     dns: 300
 };
 
+// 🔥 SAFE NUMBER HELPER (prevents "unknown" string crash)
+function safeNumber(value) {
+    const num = Number(value);
+    return isNaN(num) ? 0 : num;
+}
+
+// 🔥 Evaluate overall health
 function evaluateHealth(ping, http, dns, tcp) {
     let status = "healthy";
 
@@ -39,9 +40,9 @@ function evaluateHealth(ping, http, dns, tcp) {
     if (!dns?.success) return "critical";
 
     if (
-        ping.time > thresholds.ping ||
-        http.responseTime > thresholds.http ||
-        dns.resolveTime > thresholds.dns
+        safeNumber(ping?.time) > thresholds.ping ||
+        safeNumber(http?.responseTime) > thresholds.http ||
+        safeNumber(dns?.resolveTime) > thresholds.dns
     ) {
         status = "warning";
     }
@@ -49,55 +50,115 @@ function evaluateHealth(ping, http, dns, tcp) {
     return status;
 }
 
+// 🔥 Fetch regions from backend
+async function fetchRegions() {
+    try {
+        const res = await axios.get(`${BACKEND_URL}/api/regions`, {
+            headers: {
+                Authorization: `Bearer ${AGENT_TOKEN}`
+            }
+        });
+
+        return res.data;
+
+    } catch (error) {
+        console.error("Failed to fetch regions from backend:", error.message);
+
+        // fallback regions
+        return [
+            { name: "India", target: "8.8.8.8", httpTarget: "https://google.com" },
+            { name: "America", target: "8.8.4.4", httpTarget: "https://example.com" },
+            { name: "Russia", target: "1.1.1.1", httpTarget: "https://yandex.com" },
+            { name: "China", target: "114.114.114.114", httpTarget: "https://baidu.com" },
+            { name: "Australia", target: "1.1.1.2", httpTarget: "https://australia.com" },
+            { name: "Japan", target: "8.8.8.8", httpTarget: "https://google.co.jp" }
+        ];
+    }
+}
+
+// 🔥 Run check for one region
 async function runCheck(region) {
     try {
-        const pingResult = await pingHost(TARGET);
-        const httpResult = await httpCheck(HTTP_TARGET);
+        const pingResult = await pingHost(region.target);
+        const httpResult = await httpCheck(region.httpTarget);
         const dnsResult = await dnsCheck("google.com");
         const tcpResult = await tcpCheck("google.com", 443);
 
         const health = evaluateHealth(
-            pingResult,
-            httpResult,
-            dnsResult,
-            tcpResult
+            pingResult || {},
+            httpResult || {},
+            dnsResult || {},
+            tcpResult || {}
         );
 
         const finalResult = {
-            region,
+            region: region.name,
             timestamp: new Date(),
             status: health,
-            ping: pingResult,
-            http: httpResult,
-            dns: dnsResult,
-            tcp: tcpResult
+            ping: {
+                alive: pingResult?.alive ?? false,
+                time: safeNumber(pingResult?.time)
+            },
+            http: {
+                success: httpResult?.success ?? false,
+                responseTime: safeNumber(httpResult?.responseTime)
+            },
+            dns: {
+                success: dnsResult?.success ?? false,
+                resolveTime: safeNumber(dnsResult?.resolveTime)
+            },
+            tcp: {
+                success: tcpResult?.success ?? false
+            }
         };
 
         console.log(JSON.stringify(finalResult, null, 2));
         console.log("======================================");
 
+        await sendToBackend(finalResult);
+
     } catch (error) {
-        console.error(`Error in ${region}:`, error.message);
+        console.error(`Error in ${region.name}:`, error.message);
     }
 }
 
-// ✅ CRON (UNCHANGED LOGIC)
+// 🔥 Send to backend
+async function sendToBackend(result) {
+    try {
+        const response = await fetch(`${BACKEND_URL}/api/health/log`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify(result),
+        });
+
+        const data = await response.json();
+        console.log("Backend response:", data.message);
+
+    } catch (error) {
+        console.error("Failed to send to backend:", error.message);
+    }
+}
+
+// 🔥 CRON JOB
 cron.schedule(`*/${INTERVAL} * * * * *`, async () => {
+    const regions = await fetchRegions();
+
     for (const region of regions) {
         await runCheck(region);
     }
 });
 
-// ✅ EXPRESS ROUTE (ONLY FOR RENDER HEALTH CHECK)
+// 🔥 Health route (for Render or local check)
 app.get("/", (req, res) => {
     res.json({
         message: "Advanced Monitoring Agent Running",
-        regions,
         interval: INTERVAL + " seconds"
     });
 });
 
-// ✅ START SERVER (THIS IS WHAT RENDER NEEDS)
+// 🔥 Start server
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
     console.log("Advanced monitoring agent started...");
